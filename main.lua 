@@ -1,0 +1,307 @@
+require "import"
+import "com.androlua.Http"
+import "cjson"
+import "com.androlua.LuaDialog"
+import "android.widget.*"
+import "android.view.*"
+import "android.content.Context"
+import "android.content.Intent"
+import "android.net.Uri"
+import "android.media.MediaPlayer"
+import "android.util.Base64"
+import "android.os.*"
+import "android.graphics.Typeface"
+import "java.io.*"
+import "android.speech.tts.TextToSpeech"
+import "android.app.*"
+import "android.content.*"
+
+local context = activity or service
+local mainHandler = Handler(Looper.getMainLooper())
+local tts = nil
+local mainDialog = nil
+
+local CURRENT_VERSION = "1.2"
+local PLUGIN_PATH = "/storage/emulated/0/解说/Plugins/Google Gemini TTS/main.lua"
+local prefs = context.getSharedPreferences("GeminiTTS_Prefs", Context.MODE_PRIVATE)
+
+-- इमोशंस की लिस्ट (30 Standard + 10 18+)
+local EMOTION_LIST = {
+    "Neutral", "News Anchor", "Radio Host", "Storyteller", "Cheerful", 
+    "Happy", "Sad", "Angry", "Calm", "Urgent", 
+    "Serious", "Enthusiastic", "Professional", "Friendly", "Whispering", 
+    "Excited", "Apologetic", "Sarcastic", "Robotic", "Romantic", 
+    "Dramatic", "Soft", "Loud", "Formal", "Informal", 
+    "Narrator", "Child-like", "Old-man", "Scary", "Mystical",
+    "--- 18+ Emotions ---", 
+    "Seductive", "Flirty", "Sensual", "Breathless", "Drunk", 
+    "Aggressive", "Dominant", "Submissive", "Moaning", "Intimate"
+}
+
+local VOICE_LIST = {
+    "Puck", "Kore", "Charon", "Zephyr", "Fenrir", "Leda",
+    "Orus", "Aoede", "Callirrhoe", "Autonoe", "Enceladus", "Iapetus",
+    "Umbriel", "Algieba", "Despina", "Erinome", "Algenib", "Rasalgethi",
+    "Laomedeia", "Achernar", "Alnilam", "Schedar", "Gacrux", "Pulcherrima"
+}
+
+local TTS_MODELS = {
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+    "gemini-2.0-flash-exp"
+}
+local CHUNK_SIZE = 1500
+
+local selectedVoice = "Puck"
+local selectedModel = TTS_MODELS[1]
+local selectedEmotion = "Neutral" -- नया वेरिएबल
+local userText = ""
+local userFileName = ""
+local generatedAudioPath = nil
+local mediaPlayer = nil
+local isPlaying = false
+local googleApiKey = ""
+
+-- Safety Settings Bypass
+local safetySettings = {
+    { category = "HARM_CATEGORY_HARASSMENT", threshold = "BLOCK_NONE" },
+    { category = "HARM_CATEGORY_HATE_SPEECH", threshold = "BLOCK_NONE" },
+    { category = "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold = "BLOCK_NONE" },
+    { category = "HARM_CATEGORY_DANGEROUS_CONTENT", threshold = "BLOCK_NONE" }
+}
+
+function showToast(msg)
+    mainHandler.post(Runnable({ run = function() Toast.makeText(context, msg, Toast.LENGTH_SHORT).show() end }))
+end
+
+function vibrate()
+    local vibrator = context.getSystemService(Context.VIBRATOR_SERVICE)
+    if vibrator then pcall(function() vibrator.vibrate(35) end) end
+end
+
+function saveSettings()
+    local editor = prefs.edit()
+    editor.putString("voice", selectedVoice)
+    editor.putString("model", selectedModel)
+    editor.putString("emotion", selectedEmotion)
+    editor.putString("apikey", googleApiKey)
+    editor.putString("filename", userFileName)
+    editor.apply()
+end
+
+function loadSettings()
+    selectedVoice = prefs.getString("voice", "Puck")
+    selectedModel = prefs.getString("model", TTS_MODELS[1])
+    selectedEmotion = prefs.getString("emotion", "Neutral")
+    googleApiKey = prefs.getString("apikey", "")
+    userFileName = prefs.getString("filename", "")
+end
+
+function initMediaPlayer()
+    if mediaPlayer ~= nil then
+        if isPlaying then pcall(function() mediaPlayer.stop() end) end
+        pcall(function() mediaPlayer.release() end)
+    end
+    mediaPlayer = MediaPlayer()
+end
+
+function writeWavHeader(outStream, totalAudioLen)
+    local sampleRate = 24000
+    local channels = 1
+    local bitsPerSample = 16
+    local byteRate = sampleRate * channels * (bitsPerSample / 8)
+    local blockAlign = channels * (bitsPerSample / 8)
+    local totalSize = totalAudioLen + 36
+    local function getBytes(val) return {val & 0xff, (val >> 8) & 0xff, (val >> 16) & 0xff, (val >> 24) & 0xff} end
+    local tsB = getBytes(totalSize)
+    local srB = getBytes(sampleRate)
+    local brB = getBytes(byteRate)
+    local dlB = getBytes(totalAudioLen)
+    local header = {0x52,0x49,0x46,0x46,tsB[1],tsB[2],tsB[3],tsB[4],0x57,0x41,0x56,0x45,0x66,0x6d,0x74,0x20,0x10,0x00,0x00,0x00,0x01,0x00,0x01,0x00,srB[1],srB[2],srB[3],srB[4],brB[1],brB[2],brB[3],brB[4],blockAlign,0x00,bitsPerSample,0x00,0x64,0x61,0x74,0x61,dlB[1],dlB[2],dlB[3],dlB[4]}
+    for i=1,#header do outStream.write(header[i]) end
+end
+
+-- मुख्य जनरेशन फंक्शन (प्रॉम्प्ट और सेफ्टी के साथ)
+function generateSimpleAudio(text, voice, apikey, model, emotion, generateBtn, playBtn, resultLayout)
+    local apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/" .. model .. ":generateContent?key=" .. apikey
+    local styledText = "Style instruction: Speak the following text in a " .. emotion .. " tone. Text: " .. text
+    
+    local requestBody = {
+        contents = {{ parts = {{ text = styledText }} }},
+        safetySettings = safetySettings,
+        generationConfig = {
+            responseModalities = {"AUDIO"},
+            speechConfig = { voiceConfig = { prebuiltVoiceConfig = { voiceName = voice } } }
+        }
+    }
+    
+    Http.post(apiUrl, cjson.encode(requestBody), {["Content-Type"]="application/json"}, function(code, content)
+        if code == 200 then
+            local ok, data = pcall(cjson.decode, content)
+            if ok and data.candidates then
+                local base64Audio = data.candidates[1].content.parts[1].inlineData.data
+                local audioBytes = Base64.decode(base64Audio, Base64.NO_WRAP)
+                local tempPath = context.getCacheDir().getPath() .. "/tts_" .. os.time() .. ".wav"
+                local fos = FileOutputStream(File(tempPath))
+                writeWavHeader(fos, #audioBytes)
+                fos.write(audioBytes)
+                fos.close()
+                generatedAudioPath = tempPath
+                mainHandler.post(Runnable({run=function()
+                    resultLayout.setVisibility(View.VISIBLE)
+                    initMediaPlayer()
+                    mediaPlayer.setDataSource(generatedAudioPath)
+                    mediaPlayer.prepare()
+                    playBtn.setEnabled(true)
+                    generateBtn.setText("REGENERATE")
+                    generateBtn.setEnabled(true)
+                    showToast("Generated with " .. emotion .. " tone!")
+                end}))
+            end
+        else
+            showToast("Error: " .. code)
+            mainHandler.post(Runnable({run=function() generateBtn.setEnabled(true); generateBtn.setText("GENERATE") end}))
+        end
+    end)
+end
+
+-- अबाउट और सपोर्ट (फीडबैक डायलॉग के साथ)
+function aboutAndSupport()
+    vibrate()
+    local help_views = {}
+    local help_layout = {
+        LinearLayout; orientation="vertical"; padding="16dp"; layout_width="fill";
+        {
+            TextView;
+            text = "Google Gemini Text to Speech - Developed by Aryan\n\nFeatures: 40+ Emotions, 24+ Voices, WAV Output, and AI powered speech synthesis.\n\nVersion: " .. CURRENT_VERSION .. "\n\nDeveloped by Aryan";
+            textSize = 14; textColor = "#666666"; paddingBottom = "20dp";
+        };
+        {
+            Button; id="feedbackBtn"; text="FEEDBACK"; layout_width="fill";
+            backgroundColor="#2196F3"; textColor="#FFFFFF";
+        };
+        {
+            Button; id="goBackBtn"; text="GO BACK"; layout_width="fill"; layout_marginTop="10dp";
+            backgroundColor="#9E9E9E"; textColor="#FFFFFF";
+        };
+    }
+    local help_dialog = LuaDialog(context)
+    help_dialog.setTitle("Developed by Aryan")
+    help_dialog.setView(loadlayout(help_layout, help_views))
+    
+    help_views.feedbackBtn.onClick = function()
+        help_dialog.dismiss()
+        local f_views = {}
+        local f_layout = {
+            LinearLayout; orientation="vertical"; padding="20dp"; layout_width="fill";
+            { TextView; text="Your Name:"; paddingBottom="5dp" };
+            { EditText; id="nameIn"; hint="Enter name"; layout_width="fill"; backgroundColor="#F5F5F5"; padding="10dp" };
+            { TextView; text="Feedback:"; paddingTop="10dp"; paddingBottom="5dp" };
+            { EditText; id="msgIn"; hint="Describe issue/reason"; layout_width="fill"; layout_height="100dp"; gravity=Gravity.TOP; backgroundColor="#F5F5F5"; padding="10dp" };
+            { Button; id="sendBtn"; text="SEND FEEDBACK"; layout_marginTop="15dp"; backgroundColor="#4CAF50"; textColor="#FFFFFF" };
+        }
+        local f_dlg = LuaDialog(context)
+        f_dlg.setTitle("Feedback - Developed by Aryan")
+        f_dlg.setView(loadlayout(f_layout, f_views))
+        f_views.sendBtn.onClick = function()
+            local name = f_views.nameIn.getText().toString()
+            if name == "" then showToast("Please enter your name") return end
+            showToast("Thank you " .. name .. "! Your feedback was submitted.")
+            f_dlg.dismiss()
+        end
+        f_dlg.show()
+    end
+    help_views.goBackBtn.onClick = function() help_dialog.dismiss() end
+    help_dialog.show()
+end
+
+-- मुख्य इंटरफेस (ओरिजिनल स्टाइल में)
+function showMain()
+    loadSettings()
+    initMediaPlayer()
+    local views = {}
+    local scrollLayout = {
+        ScrollView, layout_width="fill", layout_height="fill",
+        {
+            LinearLayout, orientation="vertical", padding="30dp", layout_width="fill",
+            {
+                TextView, text="Google Gemini Text to Speech", textSize=20, textColor="#2E7D32",
+                gravity="center", paddingBottom="8dp", typeface=Typeface.DEFAULT_BOLD
+            },
+            {
+                TextView, text="Developed by Aryan  |  v" .. CURRENT_VERSION,
+                textSize=12, textColor="#666666", gravity="center", paddingBottom="25dp"
+            },
+            {
+                EditText, id="textInput", hint="Type your text here...", layout_height="150dp",
+                backgroundColor="#F5F5F5", padding="15dp", gravity=Gravity.TOP, textSize=14, layout_marginBottom="15dp"
+            },
+            { TextView, text="Voice Selection:", textSize=14, textColor="#333333", paddingBottom="5dp" },
+            { Spinner, id="voiceSpin", layout_width="fill", backgroundColor="#F5F5F5", layout_marginBottom="15dp" },
+            
+            { TextView, text="Emotion Selection:", textSize=14, textColor="#333333", paddingBottom="5dp" },
+            { Spinner, id="emotionSpin", layout_width="fill", backgroundColor="#F5F5F5", layout_marginBottom="15dp" },
+            
+            { EditText, id="fileNameInput", hint="File name (without extension)", layout_width="fill", backgroundColor="#F5F5F5", padding="12dp", layout_marginBottom="15dp" },
+            { Button, id="generateBtn", text="GENERATE", layout_width="fill", backgroundColor="#2196F3", textColor="#FFFFFF", padding="16dp", textSize=16, layout_marginBottom="15dp" },
+            
+            {
+                LinearLayout, id="resultLayout", orientation="horizontal", layout_width="fill", visibility=View.GONE, layout_marginBottom="15dp",
+                { Button, id="playBtn", text="PLAY", layout_weight=1, backgroundColor="#4CAF50", textColor="#FFFFFF", layout_marginRight="5dp", enabled=false },
+                { Button, id="downloadBtn", text="DOWNLOAD", layout_weight=1, backgroundColor="#FF9800", textColor="#FFFFFF", layout_marginLeft="5dp" }
+            },
+            {
+                LinearLayout, orientation="horizontal", layout_width="fill",
+                { Button, id="apiBtn", text="API Setting", layout_weight=1, backgroundColor="#9C27B0", textColor="#FFFFFF", layout_marginRight="5dp" },
+                { Button, id="aboutBtn", text="ABOUT & SUPPORT", layout_weight=1, backgroundColor="#607D8B", textColor="#FFFFFF", layout_marginLeft="5dp" },
+                { Button, id="exitBtn", text="EXIT", layout_weight=1, backgroundColor="#D32F2F", textColor="#FFFFFF", layout_marginLeft="5dp" }
+            }
+        }
+    }
+    
+    local dlg = LuaDialog(context)
+    dlg.setTitle("Google Gemini TTS")
+    dlg.setCancelable(false)
+    dlg.setView(loadlayout(scrollLayout, views))
+    mainDialog = dlg
+    
+    views.fileNameInput.setText(userFileName)
+    
+    -- वॉइस स्पिनर
+    local vAdapter = ArrayAdapter(context, android.R.layout.simple_spinner_item, VOICE_LIST)
+    views.voiceSpin.setAdapter(vAdapter)
+    for i,v in ipairs(VOICE_LIST) do if v == selectedVoice then views.voiceSpin.setSelection(i-1) break end end
+    views.voiceSpin.onItemSelectedListener={onItemSelected=function(p,v,pos) selectedVoice=VOICE_LIST[pos+1] saveSettings() end}
+
+    -- इमोशन स्पिनर
+    local eAdapter = ArrayAdapter(context, android.R.layout.simple_spinner_item, EMOTION_LIST)
+    views.emotionSpin.setAdapter(eAdapter)
+    for i,e in ipairs(EMOTION_LIST) do if e == selectedEmotion then views.emotionSpin.setSelection(i-1) break end end
+    views.emotionSpin.onItemSelectedListener={onItemSelected=function(p,v,pos) 
+        local choice = EMOTION_LIST[pos+1]
+        if choice ~= "--- 18+ Emotions ---" then selectedEmotion=choice saveSettings() end
+    end}
+
+    -- बटन्स के लॉजिक (ओरिजिनल)
+    views.generateBtn.onClick = function()
+        local txt = views.textInput.getText().toString()
+        if txt == "" then showToast("Enter text first!") return end
+        if googleApiKey == "" then showToast("Configure API key!") return end
+        views.generateBtn.setEnabled(false); views.generateBtn.setText("GENERATING...")
+        generateSimpleAudio(txt, selectedVoice, googleApiKey, selectedModel, selectedEmotion, views.generateBtn, views.playBtn, views.resultLayout)
+    end
+    
+    views.playBtn.onClick = function()
+        if mediaPlayer then
+            if isPlaying then mediaPlayer.pause(); isPlaying=false; views.playBtn.setText("PLAY")
+            else mediaPlayer.start(); isPlaying=true; views.playBtn.setText("PAUSE") end
+        end
+    end
+
+    views.aboutBtn.onClick = function() aboutAndSupport() end
+    views.exitBtn.onClick = function() dlg.dismiss() end
+    
+    dlg.show()
+end
+
+showMain()
